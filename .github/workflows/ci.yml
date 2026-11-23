@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --release
+      - name: Unit tests
+        run: cargo test --release
+      - name: Opcode coverage gate (R4)
+        # Synthetic one-byte + rare-family corpus cross-checked against
+        # capstone: 100% length agreement, zero panics required.
+        # PEP 668: ubuntu-24.04 runners block bare `pip install`; try
+        # pip --break-system-packages, fall back to venv.
+        run: |
+          python3 -m pip install --quiet capstone 2>/dev/null \
+            || python3 -m pip install --quiet --break-system-packages capstone \
+            || (python3 -m venv /tmp/cap && /tmp/cap/bin/pip install --quiet capstone \
+                && echo "/tmp/cap/bin" >> "$GITHUB_PATH")
+          python3 scripts/opcode_coverage.py --threshold 100
+      - name: End-to-end tests
+        run: bash scripts/e2e_test.sh
+      - name: Disasm vs objdump
+        run: python3 scripts/verify_disasm.py
+      - name: R2 corpus (gcc builds, PE64, .NET)
+        run: python3 scripts/corpus_r2.py
+
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt -- --check
+        continue-on-error: true # форматирование не блокирует релиз

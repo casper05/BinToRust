@@ -1,0 +1,18 @@
+[package]
+name = "bin-anything"
+version = "0.2.4"
+edition = "2021"
+description = "Swiss-army CLI + MCP server for AI agents to inspect, analyze, compare, patch and observe compiled binaries (ELF/PE)"
+license = "MIT"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+hex = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
