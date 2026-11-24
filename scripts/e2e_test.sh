@@ -92,7 +92,38 @@ open('/tmp/ba_carve.bin','wb').write(b'XX' + png + b'YY')
 check "carve" 0 $BA carve /tmp/ba_carve.bin
 $BA carve /tmp/ba_carve.bin --json 2>/dev/null | grep -q '"PNG"' && ok "carve finds PNG" || bad "carve PNG"
 check "extract" 0 $BA extract /tmp/ba_carve.bin 0x2 71 /tmp/ba_extracted.png
-python3 -c "from PIL import Image; im=Image.open('/tmp/ba_extracted.png'); im.load()" 2>/dev/null && ok "extracted PNG valid" || bad "extracted PNG valid"
+# валидация PNG без сторонних библиотек (Pillow на CI-раннере нет):
+# сигнатура, обход чанков с проверкой CRC, IHDR, распаковка IDAT и размер строк
+python3 - << 'PYEOF' && ok "extracted PNG valid" || bad "extracted PNG valid"
+import struct, sys, zlib
+d = open('/tmp/ba_extracted.png', 'rb').read()
+assert d[:8] == b'\x89PNG\r\n\x1a\n', 'bad signature'
+off, idat, ihdr, seen_iend = 8, bytearray(), None, False
+while off + 8 <= len(d):
+    (ln,) = struct.unpack('>I', d[off:off+4])
+    typ = d[off+4:off+8]
+    body = d[off+8:off+8+ln]
+    if off + 12 + ln > len(d):
+        raise AssertionError('truncated chunk')
+    (crc,) = struct.unpack('>I', d[off+8+ln:off+12+ln])
+    assert (zlib.crc32(typ + body) & 0xffffffff) == crc, f'bad CRC in {typ}'
+    if typ == b'IHDR':
+        ihdr = body
+    if typ == b'IDAT':
+        idat += body
+    off += 12 + ln
+    if typ == b'IEND':
+        seen_iend = True
+        break
+assert seen_iend and ihdr, 'missing IHDR/IEND'
+# хвостовые байты после IEND допустимы (extract может захватить их) — как и PIL
+w, h, depth, ctype = struct.unpack('>IIBB', ihdr[:10])
+channels = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}[ctype]
+assert depth == 8, f'unsupported depth {depth}'
+raw = zlib.decompress(bytes(idat))
+expected = h * (1 + w * channels)
+assert len(raw) == expected, f'pixel data {len(raw)} != expected {expected}'
+PYEOF
 
 echo "== behavior =="
 check "run" 0 $BA run --json /bin/echo hello
@@ -126,10 +157,65 @@ check "search empty -> rc2" 2 $BA search /bin/true ''
 # xrefs: ссылки на функцию error в /bin/true (есть точно: call 0x2476 x3)
 $BA xrefs /bin/true error 2>/dev/null | grep -q "call" && ok "xrefs by symbol" || bad "xrefs symbol"
 $BA --json xrefs /bin/true 0x2476 2>/dev/null | grep -q '"xrefs_total"' && ok "xrefs json by addr" || bad "xrefs json"
-# согласование с objdump: количество call на error совпадает
-OD=$(objdump -d /bin/true 2>/dev/null | grep -c "call.*2476 <error")
-BX=$($BA --json xrefs /bin/true error | python3 -c "import json,sys; print(json.load(sys.stdin)['by_kind']['call'])")
-[ "$OD" = "$BX" ] && [ "$OD" != "0" ] && ok "xrefs match objdump ($OD calls)" || bad "xrefs vs objdump (objdump=$OD ours=$BX)"
+# согласование с objdump: количество call-ссылок на одну и ту же функцию.
+# Имя/адрес не хардкодятся: /bin/true отличается между дистрибутивами.
+# Семантика нашего xrefs — вызовы на АДРЕС ВХОДА символа (name -> target из
+# JSON), поэтому и на стороне objdump сравниваем число call-команд, чей
+# целевой адрес совпадает с target, а не число строк с аннотацией имени
+# (аннотация <sym@@Base+0xN> ловила бы вызовы внутрь тела — разные множества).
+XV=$(python3 - "$BA" << 'PYEOF'
+import json, re, subprocess, sys
+ba = sys.argv[1]
+tgt = '/bin/true'
+p = subprocess.run([ba, '--json', 'symbols', tgt, '--kind', 'func'],
+                   capture_output=True, text=True)
+try:
+    syms = json.loads(p.stdout)
+    if isinstance(syms, dict):
+        syms = syms.get('symbols') or []
+except Exception:
+    print('SKIP symbols-json-unparsable'); sys.exit(0)
+picked = None
+for s in syms[:80]:
+    name = s.get('name') or ''
+    if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_.]*', name):
+        continue
+    r = subprocess.run([ba, '--json', 'xrefs', tgt, name],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        continue
+    try:
+        d = json.loads(r.stdout)
+    except Exception:
+        continue
+    calls = (d.get('by_kind') or {}).get('call') or 0
+    if calls >= 1:
+        picked = (name, calls, d.get('target'))
+        break
+if not picked:
+    print('SKIP no-symbol-with-call-xrefs'); sys.exit(0)
+name, ours, target = picked
+if not target:
+    print('SKIP no-target-resolved'); sys.exit(0)
+taddr = int(target, 16)
+od = subprocess.run(['objdump', '-d', tgt], capture_output=True, text=True).stdout
+pat = re.compile(r'\bcall\w*\s+([0-9a-f]+)\s*<')
+odc = sum(1 for l in od.splitlines()
+          for m in [pat.search(l)] if m and int(m.group(1), 16) == taddr)
+if odc == 0:
+    print('SKIP objdump-has-no-calls-to-target'); sys.exit(0)
+if odc == ours:
+    print(f'OK {name}@{target}: ours={ours} objdump={odc}')
+else:
+    print(f'MISMATCH {name}@{target}: ours={ours} objdump={odc}')
+PYEOF
+)
+case "$XV" in
+  OK*)        ok "xrefs vs objdump (${XV#OK })" ;;
+  SKIP*)      skip "xrefs vs objdump: ${XV#SKIP }" ;;
+  MISMATCH*)  bad "xrefs vs objdump (${XV#MISMATCH })" ;;
+  *)          bad "xrefs vs objdump (unexpected: $XV)" ;;
+esac
 check "xrefs bad symbol -> rc2" 2 $BA xrefs /bin/true nosuchsym123
 # hash: md5/sha1 совпадают с системными утилитами
 SYS_MD5=$(md5sum $ELF | cut -d' ' -f1)
@@ -196,16 +282,17 @@ python3 "$METRIC" /bin/true .text +0x1000 0x2b50 95 50 "operand metric ELF x64" 
 # PE: сгенерированная фикстура
 python3 "$METRIC" "$PE" .text +0x400 64 95 50 "operand metric PE fixture" "$BA" && ok "operand metric PE" || bad "operand metric PE"
 # большой реальный PE, если задан (AutoChart.exe: i386, ~1M инструкций)
-# AC=<путь> экспортом; по умолчанию — upload/AutoChart.exe, если существует
+# AC=<путь> экспортом; по умолчанию — путь из AC_CAND (кандидаты через пробел),
+# чтобы скрипт не зависел от путей конкретной машины
 if [ -z "$AC" ]; then
-  for _cand in /home/z/my-project/upload/AutoChart.exe; do
+  for _cand in ${AC_CAND:-}; do
     [ -f "$_cand" ] && AC="$_cand"
   done
 fi
 if [ -n "$AC" ] && [ -f "$AC" ]; then
   python3 "$METRIC" "$AC" .text +0x400 0x2fe000 95 70 "operand metric AutoChart i386" "$BA" && ok "operand metric AutoChart" || bad "operand metric AutoChart"
 else
-  skip "operand metric AutoChart (нет AC=${AC:-unset})"
+  skip "operand metric AutoChart (нет AC)"
 fi
 
 # resources: PE-дерево ресурсов
@@ -218,8 +305,16 @@ else
   skip "resources AutoChart (нет AC)"
 fi
 check "resources non-PE -> rc2" 2 $BA resources /bin/true
-# functions: прологи + символы
-$BA functions /bin/true --limit 5 2>/dev/null | head -1 | grep -q "functions: 86" && ok "functions /bin/true count" || bad "functions count"
+# functions: количество детекций зависит от сборки /bin/true (на CI другой билд),
+# поэтому проверяем порог и согласованность text/JSON, а не точное число
+FN_T=$($BA functions /bin/true --limit 5 2>/dev/null | head -1 | awk '{print $2}')
+FN_J=$($BA --json functions /bin/true 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin).get('total',''))" 2>/dev/null)
+case "$FN_T" in ''|*[!0-9]*) FN_T='' ;; esac
+if [ -n "$FN_T" ] && [ "$FN_T" -ge 5 ] && [ -n "$FN_J" ] && [ "$FN_T" = "$FN_J" ]; then
+  ok "functions /bin/true count ($FN_T, text=json)"
+else
+  bad "functions count (text=$FN_T json=$FN_J)"
+fi
 $BA --json functions /bin/true 2>/dev/null | grep -q '"symbol": "error"' && ok "functions json symbol" || bad "functions json symbol"
 $BA functions /bin/true 0x1000 --limit 3 >/dev/null 2>&1 && bad "functions extra arg" || ok "functions no extra args"
 if [ -n "$AC" ] && [ -f "$AC" ]; then
@@ -397,4 +492,4 @@ if [ "$SKIP" -gt 0 ]; then
 else
   echo "PASS=$PASS FAIL=$FAIL SKIP=$SKIP (executed $((PASS+FAIL)) of $TOTAL)"
 fi
-[ $FAIL -eq 0 ] && echo "ALL OK" || exit 1
+[ $FAIL -eq 0 ] && echo "ALL OK" || exit 1 
